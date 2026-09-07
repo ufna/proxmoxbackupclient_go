@@ -137,6 +137,12 @@ type PBSClient struct {
 	Namespace string
 	Manifest  BackupManifest
 
+	// Crypt, when non-nil, enables client-side AES-256-GCM encryption: chunks
+	// are stored as encrypted DataBlobs and their digests are keyed with the
+	// key's id_key. nil preserves the original plaintext (crypt-mode "none")
+	// behaviour.
+	Crypt *CryptConfig
+
 	Insecure bool
 
 	Client    http.Client
@@ -482,7 +488,7 @@ func (pbs *PBSClient) CreateFixedIndex(fic FixedIndexCreateReq) (uint64, error) 
 	fmt.Println("Writer id: ", R.WriterID)
 	defer resp2.Body.Close()
 	f := File{
-		CryptMode: "none",
+		CryptMode: pbs.cryptModeStr(),
 		Csum:      "",
 		Filename:  fic.ArchiveName,
 		Size:      0,
@@ -639,7 +645,7 @@ func (pbs *PBSClient) CreateDynamicIndex(name string) (uint64, error) {
 	fmt.Println("Writer id: ", R.WriterID)
 	defer resp2.Body.Close()
 	f := File{
-		CryptMode: "none",
+		CryptMode: pbs.cryptModeStr(),
 		Csum:      "",
 		Filename:  name,
 		Size:      0,
@@ -662,9 +668,38 @@ func (pbs *PBSClient) UploadFixedCompressedChunk(writerid uint64, digest string,
 	return pbs.UploadChunk(writerid, digest, chunkdata, false, true)
 }
 
+// cryptModeStr is the manifest crypt-mode for chunked archives written by this
+// session: "encrypt" when a key is configured, else "none".
+func (pbs *PBSClient) cryptModeStr() string {
+	if pbs.Crypt != nil {
+		return "encrypt"
+	}
+	return "none"
+}
+
+// ChunkDigest returns the digest that names a chunk and indexes it. With
+// encryption it is the key-scoped digest (SHA256(data || id_key)); without, the
+// plain SHA256. Both the chunk upload and the dynamic-index checksum must use
+// this same value.
+func (pbs *PBSClient) ChunkDigest(data []byte) [32]byte {
+	if pbs.Crypt != nil {
+		return pbs.Crypt.ComputeDigest(data)
+	}
+	return sha256.Sum256(data)
+}
+
 func (pbs *PBSClient) UploadChunk(writerid uint64, digest string, chunkdata []byte, dynamic bool, compressed bool) error {
 	outBuffer := make([]byte, 0)
-	if compressed {
+	if pbs.Crypt != nil {
+		// Encrypted DataBlob: magic | crc | iv | tag | ciphertext, zstd before
+		// encryption. EncodeChunk keeps compression only when it shrinks, so the
+		// `compressed` hint is advisory here.
+		blob, err := pbs.Crypt.EncodeChunk(chunkdata, compressed)
+		if err != nil {
+			return fmt.Errorf("encrypt chunk %s: %w", digest, err)
+		}
+		outBuffer = blob
+	} else if compressed {
 		outBuffer = append(outBuffer, blobCompressedMagic...)
 		compressedData := make([]byte, 0)
 
