@@ -36,6 +36,16 @@ const (
 	PXAR_PAYLOAD             uint64 = 0x28147a1b0b7c1a25
 	PXAR_GOODBYE             uint64 = 0x2fec4fa642d5731d
 	PXAR_GOODBYE_TAIL_MARKER uint64 = 0xef5eed5b753e1555
+	// Split-archive (format v2) markers — see pxar crate src/format/mod.rs.
+	// The metadata (.mpxar) stream opens with a FORMAT_VERSION entry (value 2) and
+	// references each file's bytes with a PAYLOAD_REF instead of inlining them; the
+	// payload (.ppxar) stream carries the bytes, framed by start/tail markers. This
+	// is what lets an incremental reuse unchanged files' payload chunks without
+	// re-reading them.
+	PXAR_FORMAT_VERSION       uint64 = 0x730f6c75df16a40d
+	PXAR_PAYLOAD_REF          uint64 = 0x419d3d6bc4ba977e
+	PXAR_PAYLOAD_START_MARKER uint64 = 0x834c68c2194a4ed2
+	PXAR_PAYLOAD_TAIL_MARKER  uint64 = 0x6c72b78b984c81b5
 )
 
 var catalog_magic = []byte{145, 253, 96, 249, 196, 103, 88, 213}
@@ -261,6 +271,17 @@ func ca_make_bst(input []GoodByeItem, output *[]GoodByeItem) {
 
 type PXAROutCB func([]byte) error
 
+// PayloadReuseFunc, given a regular file's archive-relative path, size and mtime,
+// returns the ordered payload chunk digests recorded for it by a previous backup
+// (and true) when the file is unchanged, so its bytes can be referenced without
+// reading. Returning ok=false means "read and re-chunk the file".
+type PayloadReuseFunc func(relPath string, size uint64, mtimeSecs uint64) (digests []string, ok bool)
+
+// ReuseSinkFunc records the payload chunk digests actually used for a file's
+// span (whether reused or freshly chunked), so the caller can persist them as
+// the reference for the next run.
+type ReuseSinkFunc func(relPath string, size uint64, mtimeSecs uint64, digests []string)
+
 // MetaCollector is an optional hook invoked during the PXAR walk for every
 // directory and regular file that is actually being backed up (after skip
 // checks). Implementations capture per-entry metadata that PXAR itself cannot
@@ -283,6 +304,25 @@ type PXARArchive struct {
 	buffer         bytes.Buffer
 	pos            uint64
 	ArchiveName    string
+
+	// Split enables format v2: metadata goes to WriteCB (the .mpxar stream) and
+	// file payloads to PayloadWriteCB (the .ppxar stream), referenced by
+	// PAYLOAD_REF. When false the archive is a single legacy pxar (payload inline).
+	// In split mode CatalogWriteCB must be nil — the .mpxar replaces the catalog.
+	Split          bool
+	PayloadWriteCB PXAROutCB
+	payloadBuffer  bytes.Buffer
+	payloadPos     uint64
+	// PayloadReuse, if set, is consulted per regular file before reading it: given
+	// the file's path/size/mtime it may return the payload chunk digests recorded
+	// by a previous backup, letting us reference them without opening the file.
+	PayloadReuse PayloadReuseFunc
+	// ReuseSink receives, per regular file, the digests actually used for its
+	// payload span (reused or freshly chunked) so the caller can persist them for
+	// the next run.
+	ReuseSink ReuseSinkFunc
+	reusedFiles int
+	readFiles   int
 
 	catalog_pos  uint64
 	SkippedFiles []string // ALL skips (read errors, junctions, system auto-excludes) — for logging/sidecar display
@@ -343,6 +383,52 @@ func (a *PXARArchive) Flush() error {
 func (a *PXARArchive) Create() {
 	a.pos = 0
 	a.catalog_pos = 8
+}
+
+// FlushPayload drains the payload buffer into PayloadWriteCB (the .ppxar chunk
+// stream) and advances the payload position. Mirror of Flush for the split
+// payload stream.
+func (a *PXARArchive) FlushPayload() error {
+	b := make([]byte, 64*1024)
+	for {
+		count, _ := a.payloadBuffer.Read(b)
+		if count <= 0 {
+			break
+		}
+		if err := a.PayloadWriteCB(b[:count]); err != nil {
+			return fmt.Errorf("failed to write payload data: %w", err)
+		}
+		a.payloadPos += uint64(count)
+	}
+	return nil
+}
+
+// startSplit emits the format-v2 preamble: a FORMAT_VERSION(2) entry into the
+// metadata stream and a PAYLOAD_START_MARKER into the payload stream. Called once
+// at the top of the archive. FORMAT_VERSION is written to a.buffer (not flushed
+// here) so the caller's Flush advances a.pos past it, keeping goodbye offsets
+// consistent; the start marker is flushed so payloadPos becomes 16.
+func (a *PXARArchive) startSplit() error {
+	binary.Write(&a.buffer, binary.LittleEndian, PXAR_FORMAT_VERSION)
+	binary.Write(&a.buffer, binary.LittleEndian, uint64(24)) // full_size = 16 header + 8 value
+	binary.Write(&a.buffer, binary.LittleEndian, uint64(2))  // FormatVersion::Version2
+
+	binary.Write(&a.payloadBuffer, binary.LittleEndian, PXAR_PAYLOAD_START_MARKER)
+	binary.Write(&a.payloadBuffer, binary.LittleEndian, uint64(16)) // content_size 0
+	return a.FlushPayload()
+}
+
+// FinishSplit writes the PAYLOAD_TAIL_MARKER that closes the payload stream.
+// Call it once, after WriteDir, before closing the payload chunk index.
+func (a *PXARArchive) FinishSplit() error {
+	binary.Write(&a.payloadBuffer, binary.LittleEndian, PXAR_PAYLOAD_TAIL_MARKER)
+	binary.Write(&a.payloadBuffer, binary.LittleEndian, uint64(16))
+	return a.FlushPayload()
+}
+
+// ReuseStats reports how many regular files had their payload reused vs read.
+func (a *PXARArchive) ReuseStats() (reused int, read int) {
+	return a.reusedFiles, a.readFiles
 }
 
 type CatalogDir struct {
@@ -465,7 +551,13 @@ func (a *PXARArchive) WriteDir(path string, dirname string, toplevel bool) (Cata
 		a.buffer.WriteString(dirname)
 		a.buffer.WriteByte(0x00)
 	} else {
-		if a.CatalogWriteCB != nil {
+		if a.Split {
+			// Format v2: FORMAT_VERSION into metadata + PAYLOAD_START_MARKER into
+			// payload. No catalog (the .mpxar serves that role).
+			if err := a.startSplit(); err != nil {
+				return CatalogDir{}, err
+			}
+		} else if a.CatalogWriteCB != nil {
 			if err := a.CatalogWriteCB(catalog_magic); err != nil {
 				return CatalogDir{}, fmt.Errorf("failed to write catalog magic: %w", err)
 			}
@@ -777,14 +869,36 @@ func (a *PXARArchive) WriteFile(path string, basename string) (CatalogFile, erro
 	// and the read below (common for files in use WITHOUT VSS: logs, .pst, SQL .mdf)
 	// would otherwise desynchronise the whole archive and corrupt every entry that
 	// follows. So we cap reads at declaredSize and zero-pad any shortfall.
-	binary.Write(&a.buffer, binary.LittleEndian, PXAR_PAYLOAD)
 	declaredSize := uint64(fileInfo.Size())
-	filesize := declaredSize + 16 //Payload size + header size
-	binary.Write(&a.buffer, binary.LittleEndian, filesize)
 
-	if err := a.Flush(); err != nil {
+	// Legacy: payload header + data are written inline into the metadata stream.
+	// Split (v2): the metadata stream gets a PAYLOAD_REF pointing at where the
+	// bytes will land in the payload stream, and the header + data go to the
+	// payload stream instead. Everything downstream (read loop, short/grow
+	// handling) writes to writeTarget/flushFn, which is the payload buffer in
+	// split mode and the metadata buffer otherwise.
+	writeTarget := &a.buffer
+	flushFn := a.Flush
+	if a.Split {
+		binary.Write(&a.buffer, binary.LittleEndian, PXAR_PAYLOAD_REF)
+		binary.Write(&a.buffer, binary.LittleEndian, uint64(32)) // full_size = 16 header + 16 PayloadRef
+		binary.Write(&a.buffer, binary.LittleEndian, a.payloadPos) // offset into payload stream
+		binary.Write(&a.buffer, binary.LittleEndian, declaredSize) // payload content size
+		if err := a.Flush(); err != nil {
+			return CatalogFile{}, err
+		}
+		writeTarget = &a.payloadBuffer
+		flushFn = a.FlushPayload
+	}
+
+	binary.Write(writeTarget, binary.LittleEndian, PXAR_PAYLOAD)
+	filesize := declaredSize + 16 //Payload size + header size
+	binary.Write(writeTarget, binary.LittleEndian, filesize)
+
+	if err := flushFn(); err != nil {
 		return CatalogFile{}, err
 	}
+	a.readFiles++
 
 	readbuffer := make([]byte, 1024*64)
 	var written uint64
@@ -796,9 +910,9 @@ func (a *PXARArchive) WriteFile(path string, basename string) (CatalogFile, erro
 		}
 		nread, err := file.Read(readbuffer[:toRead])
 		if nread > 0 {
-			a.buffer.Write(readbuffer[:nread])
+			writeTarget.Write(readbuffer[:nread])
 			written += uint64(nread)
-			if ferr := a.Flush(); ferr != nil {
+			if ferr := flushFn(); ferr != nil {
 				return CatalogFile{}, ferr
 			}
 		}
@@ -823,9 +937,9 @@ func (a *PXARArchive) WriteFile(path string, basename string) (CatalogFile, erro
 			if remaining := declaredSize - written; remaining < n {
 				n = remaining
 			}
-			a.buffer.Write(pad[:n])
+			writeTarget.Write(pad[:n])
 			written += n
-			if ferr := a.Flush(); ferr != nil {
+			if ferr := flushFn(); ferr != nil {
 				return CatalogFile{}, ferr
 			}
 		}
@@ -841,7 +955,7 @@ func (a *PXARArchive) WriteFile(path string, basename string) (CatalogFile, erro
 		}
 	}
 
-	if err := a.Flush(); err != nil {
+	if err := flushFn(); err != nil {
 		return CatalogFile{}, err
 	}
 

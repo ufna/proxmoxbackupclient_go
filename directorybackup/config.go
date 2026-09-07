@@ -41,6 +41,8 @@ type Config struct {
 	BackupStreamName string      `json:"backupstreamname"`
 	PxarOut          string      `json:"pxarout"`
 	Keyfile          string      `json:"keyfile"`
+	Split            bool        `json:"split"`
+	StatePath        string      `json:"state"`
 	SMTP             *SMTPConfig `json:"smtp"`
 	UseVSS 			 bool        `json:"usevss"`
 }
@@ -83,6 +85,8 @@ func loadConfig() *Config {
 	backupStreamNameFlag := flag.String("backupstream", "", "Filename for stream backup")
 	pxarOutFlag := flag.String("pxarout", "", "Output PXAR archive for debug purposes (optional)")
 	keyfileFlag := flag.String("keyfile", "", "Path to a PBS encryption keyfile (kdf=none JSON). When set, chunks are AES-256-GCM encrypted client-side (crypt-mode=encrypt).")
+	splitFlag := flag.Bool("split", false, "Use split-archive format v2 (.mpxar/.ppxar). Enables metadata-based incremental: with -state, unchanged files are not re-read.")
+	stateFlag := flag.String("state", "", "Path to a local reuse-state file (JSON). With -split, records per-file payload chunk digests so the next run can skip re-reading unchanged files.")
 	noVSSFlag := flag.Bool("novss", false, "Disable VSS ( For filesystems that don't support it, for example veracrypt )")
 
 	mailHostFlag := flag.String("mail-host", "", "mail notification system: mail server host(optional)")
@@ -155,6 +159,12 @@ func loadConfig() *Config {
 	}
 	if *keyfileFlag != "" {
 		config.Keyfile = *keyfileFlag
+	}
+	if *splitFlag {
+		config.Split = true
+	}
+	if *stateFlag != "" {
+		config.StatePath = *stateFlag
 	}
 	if *noVSSFlag {
 		config.UseVSS = false
