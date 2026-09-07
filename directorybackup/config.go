@@ -44,7 +44,7 @@ type Config struct {
 	Split            bool        `json:"split"`
 	StatePath        string      `json:"state"`
 	SMTP             *SMTPConfig `json:"smtp"`
-	UseVSS 			 bool        `json:"usevss"`
+	UseVSS           bool        `json:"usevss"`
 }
 
 func (c *Config) valid() bool {

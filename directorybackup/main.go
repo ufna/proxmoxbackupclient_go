@@ -40,8 +40,12 @@ type ChunkState struct {
 	newchunk           *atomic.Uint64
 	reusechunk         *atomic.Uint64
 	knownChunks        *haxmap.Map[string, bool]
-}
 
+	// recording captures the chunks emitted between BeginRecord and EndRecord, so
+	// a file's payload span can be recorded for next-run reuse.
+	recording bool
+	recorded  []pbscommon.ReusedChunk
+}
 
 func (c *ChunkState) Init(newchunk *atomic.Uint64, reusechunk *atomic.Uint64, knownChunks *haxmap.Map[string, bool]) {
 	c.assignments = make([]string, 0)
@@ -57,6 +61,103 @@ func (c *ChunkState) Init(newchunk *atomic.Uint64, reusechunk *atomic.Uint64, kn
 	c.knownChunks = knownChunks
 }
 
+// emitCurrentChunk finalizes the pending chunk: compute its (key-scoped) digest,
+// upload it if new, register it in the dynamic index at the current offset, and
+// (when recording) note it for reuse. No-op if the buffer is empty.
+func (c *ChunkState) emitCurrentChunk(client *pbscommon.PBSClient) error {
+	if len(c.current_chunk) == 0 {
+		return nil
+	}
+	bindigest := client.ChunkDigest(c.current_chunk)
+	shahash := hex.EncodeToString(bindigest[:])
+	length := uint64(len(c.current_chunk))
+
+	if _, ok := c.knownChunks.GetOrSet(shahash, true); !ok {
+		c.newchunk.Add(1)
+		if err := client.UploadDynamicCompressedChunk(c.wrid, shahash, c.current_chunk); err != nil {
+			return fmt.Errorf("failed to upload chunk %s: %w", shahash, err)
+		}
+	} else {
+		c.reusechunk.Add(1)
+	}
+
+	if err := binary.Write(c.chunkdigests, binary.LittleEndian, c.pos+length); err != nil {
+		return fmt.Errorf("failed to write chunk offset: %w", err)
+	}
+	if _, err := c.chunkdigests.Write(bindigest[:]); err != nil {
+		return fmt.Errorf("failed to write chunk digest: %w", err)
+	}
+	c.assignments_offset = append(c.assignments_offset, c.pos)
+	c.assignments = append(c.assignments, shahash)
+	if c.recording {
+		c.recorded = append(c.recorded, pbscommon.ReusedChunk{Digest: shahash, Length: length})
+	}
+	c.pos += length
+	c.chunkcount++
+	c.current_chunk = make([]byte, 0)
+	return nil
+}
+
+// Break finalizes any pending chunk and resets the content-defined chunker, so
+// the next bytes start a fresh chunk. This aligns a file's payload span to chunk
+// boundaries — required so the span is whole chunks that can be recorded and,
+// next run, referenced without re-reading. Deterministic: the same file content
+// after a Break always produces the same chunks.
+func (c *ChunkState) Break(client *pbscommon.PBSClient) error {
+	if err := c.emitCurrentChunk(client); err != nil {
+		return err
+	}
+	c.C = pbscommon.Chunker{}
+	c.C.New(1024 * 1024 * 4)
+	return nil
+}
+
+// BeginRecord/EndRecord bracket a file span whose emitted chunks should be
+// captured for next-run reuse.
+func (c *ChunkState) BeginRecord() {
+	c.recording = true
+	c.recorded = nil
+}
+
+func (c *ChunkState) EndRecord() []pbscommon.ReusedChunk {
+	c.recording = false
+	out := c.recorded
+	c.recorded = nil
+	return out
+}
+
+// AssignKnown references already-existing chunks (from a previous backup) in the
+// dynamic index at the current position, without uploading data — this is how an
+// unchanged file's payload is reused. The caller must have Broken first so the
+// index position is chunk-aligned. Advances pos by the chunks' total length.
+func (c *ChunkState) AssignKnown(chunks []pbscommon.ReusedChunk) error {
+	if len(c.current_chunk) != 0 {
+		return fmt.Errorf("AssignKnown called with %d unflushed bytes (missing Break)", len(c.current_chunk))
+	}
+	for _, ch := range chunks {
+		raw, err := hex.DecodeString(ch.Digest)
+		if err != nil || len(raw) != 32 {
+			return fmt.Errorf("invalid reused chunk digest %q", ch.Digest)
+		}
+		if err := binary.Write(c.chunkdigests, binary.LittleEndian, c.pos+ch.Length); err != nil {
+			return err
+		}
+		if _, err := c.chunkdigests.Write(raw); err != nil {
+			return err
+		}
+		c.assignments_offset = append(c.assignments_offset, c.pos)
+		c.assignments = append(c.assignments, ch.Digest)
+		c.knownChunks.Set(ch.Digest, true)
+		c.reusechunk.Add(1)
+		c.pos += ch.Length
+		c.chunkcount++
+		if c.recording {
+			c.recorded = append(c.recorded, ch)
+		}
+	}
+	return nil
+}
+
 func (c *ChunkState) HandleData(b []byte, client *pbscommon.PBSClient) error {
 	chunkpos := c.C.Scan(b)
 
@@ -69,37 +170,10 @@ func (c *ChunkState) HandleData(b []byte, client *pbscommon.PBSClient) error {
 			//Append data until break position
 			c.current_chunk = append(c.current_chunk, b[:chunkpos]...)
 
-			// Keyed digest when encrypting (SHA256(chunk||id_key)), plain SHA256
-			// otherwise. Names the chunk AND feeds the index checksum below —
-			// both must use the same value.
-			bindigest := client.ChunkDigest(c.current_chunk)
-			shahash := hex.EncodeToString(bindigest[:])
-
-			if _, ok := c.knownChunks.GetOrSet(shahash, true); !ok {
-				fmt.Printf("New chunk[%s] %d bytes\n", shahash, len(c.current_chunk))
-				c.newchunk.Add(1)
-
-				if err := client.UploadDynamicCompressedChunk(c.wrid, shahash, c.current_chunk); err != nil {
-					return fmt.Errorf("failed to upload chunk %s: %w", shahash, err)
-				}
-			} else {
-				fmt.Printf("Reuse chunk[%s] %d bytes\n", shahash, len(c.current_chunk))
-				c.reusechunk.Add(1)
+			if err := c.emitCurrentChunk(client); err != nil {
+				return err
 			}
 
-			if err := binary.Write(c.chunkdigests, binary.LittleEndian, (c.pos + uint64(len(c.current_chunk)))); err != nil {
-				return fmt.Errorf("failed to write chunk offset: %w", err)
-			}
-			if _, err := c.chunkdigests.Write(bindigest[:]); err != nil {
-				return fmt.Errorf("failed to write chunk digest: %w", err)
-			}
-
-			c.assignments_offset = append(c.assignments_offset, c.pos)
-			c.assignments = append(c.assignments, shahash)
-			c.pos += uint64(len(c.current_chunk))
-			c.chunkcount += 1
-
-			c.current_chunk = make([]byte, 0)
 			b = b[chunkpos:] //Take remainder of data
 			chunkpos = c.C.Scan(b)
 
@@ -114,31 +188,8 @@ func (c *ChunkState) HandleData(b []byte, client *pbscommon.PBSClient) error {
 func (c *ChunkState) Eof(client *pbscommon.PBSClient) error {
 	//Here we write the remainder of data for which cyclic hash did not trigger
 
-	if len(c.current_chunk) > 0 {
-		bindigest := client.ChunkDigest(c.current_chunk)
-		shahash := hex.EncodeToString(bindigest[:])
-		if err := binary.Write(c.chunkdigests, binary.LittleEndian, (c.pos + uint64(len(c.current_chunk)))); err != nil {
-			return fmt.Errorf("failed to write final chunk offset: %w", err)
-		}
-		if _, err := c.chunkdigests.Write(bindigest[:]); err != nil {
-			return fmt.Errorf("failed to write final chunk digest: %w", err)
-		}
-
-			if _, ok := c.knownChunks.GetOrSet(shahash, true); !ok {
-			fmt.Printf("New chunk[%s] %d bytes\n", shahash, len(c.current_chunk))
-			if err := client.UploadDynamicCompressedChunk(c.wrid, shahash, c.current_chunk); err != nil {
-				return fmt.Errorf("failed to upload final chunk %s: %w", shahash, err)
-			}
-			c.newchunk.Add(1)
-		} else {
-			fmt.Printf("Reuse chunk[%s] %d bytes\n", shahash, len(c.current_chunk))
-			c.reusechunk.Add(1)
-		}
-		c.assignments_offset = append(c.assignments_offset, c.pos)
-		c.assignments = append(c.assignments, shahash)
-		c.pos += uint64(len(c.current_chunk))
-		c.chunkcount += 1
-
+	if err := c.emitCurrentChunk(client); err != nil {
+		return err
 	}
 	//Avoid incurring in request entity too large by chunking assignment PUT requests in blocks of at most 128 chunks
 	for k := 0; k < len(c.assignments); k += 128 {
@@ -422,9 +473,35 @@ func backup_real_split(client *pbscommon.PBSClient, newchunk, reusechunk *atomic
 		return nil, err
 	}
 
-	// Phase 2 (reuse) wiring goes here: load state, set archive.PayloadReuse /
-	// ReuseSink / ReuseAssign. Phase 1 always reads.
-	_ = statePath
+	// Metadata reuse: files unchanged since the previous run (same size+mtime,
+	// recorded in the local state) reference their payload chunks instead of being
+	// re-read. Guarded so we only ever reference chunks the previous snapshot still
+	// holds (seeded into knownChunks) — a stale state can cause a re-read, never a
+	// dangling reference.
+	state := LoadReuseState(statePath)
+	newState := NewReuseState()
+	archive.ReuseThreshold = 1024 * 1024 // 1 MiB — below this, reading is cheap
+	archive.Hooks = pbscommon.ReuseHooks{
+		Break:       func() error { return ppxarChunk.Break(client) },
+		BeginRecord: ppxarChunk.BeginRecord,
+		EndRecord:   ppxarChunk.EndRecord,
+		AssignKnown: ppxarChunk.AssignKnown,
+	}
+	archive.PayloadReuse = func(rel string, size, mtime uint64) ([]pbscommon.ReusedChunk, bool) {
+		chunks, ok := state.Lookup(rel, size, mtime)
+		if !ok {
+			return nil, false
+		}
+		for _, ch := range chunks {
+			if _, exists := knownChunks.Get(ch.Digest); !exists {
+				return nil, false // previous snapshot no longer has it — re-read
+			}
+		}
+		return chunks, true
+	}
+	archive.ReuseSink = func(rel string, size, mtime uint64, chunks []pbscommon.ReusedChunk) {
+		newState.Record(rel, size, mtime, chunks)
+	}
 
 	archive.WriteCB = func(b []byte) error { return mpxarChunk.HandleData(b, client) }
 	archive.PayloadWriteCB = func(b []byte) error { return ppxarChunk.HandleData(b, client) }
@@ -448,6 +525,9 @@ func backup_real_split(client *pbscommon.PBSClient, newchunk, reusechunk *atomic
 
 	reused, read := archive.ReuseStats()
 	fmt.Printf("Split backup: %d files reused (not read), %d files read.\n", reused, read)
+	if err := SaveReuseState(statePath, newState); err != nil {
+		fmt.Printf("warning: could not save reuse state: %v\n", err)
+	}
 	return archive.ReadErrors, nil
 }
 

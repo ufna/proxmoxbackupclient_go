@@ -55,16 +55,16 @@ var catalog_magic = []byte{145, 253, 96, 249, 196, 103, 88, 213}
 // that should not be included in file-mode backups
 var excludedSystemFolders = []string{
 	"System Volume Information", // VSS snapshots storage
-	"$RECYCLE.BIN",               // Windows recycle bin
-	"Recovery",                   // Windows recovery partition data
+	"$RECYCLE.BIN",              // Windows recycle bin
+	"Recovery",                  // Windows recovery partition data
 }
 
 // Windows system files to exclude automatically from backups
 // These are large paging/hibernation files that should not be backed up
 var excludedSystemFiles = []string{
-	"pagefile.sys",  // Windows page file
-	"hiberfil.sys",  // Hibernation file
-	"swapfile.sys",  // Windows swap file
+	"pagefile.sys",      // Windows page file
+	"hiberfil.sys",      // Hibernation file
+	"swapfile.sys",      // Windows swap file
 	"DumpStack.log.tmp", // Crash dump temporary file
 }
 
@@ -271,16 +271,41 @@ func ca_make_bst(input []GoodByeItem, output *[]GoodByeItem) {
 
 type PXAROutCB func([]byte) error
 
-// PayloadReuseFunc, given a regular file's archive-relative path, size and mtime,
-// returns the ordered payload chunk digests recorded for it by a previous backup
-// (and true) when the file is unchanged, so its bytes can be referenced without
-// reading. Returning ok=false means "read and re-chunk the file".
-type PayloadReuseFunc func(relPath string, size uint64, mtimeSecs uint64) (digests []string, ok bool)
+// ReusedChunk is one payload chunk of a file's span: its digest (the chunk name
+// in the datastore) and its byte length. A file's payload span [PXAR_PAYLOAD
+// header + data] is covered by an ordered list of these; reusing the file means
+// referencing the same chunks without re-reading it.
+type ReusedChunk struct {
+	Digest string `json:"d"`
+	Length uint64 `json:"l"`
+}
 
-// ReuseSinkFunc records the payload chunk digests actually used for a file's
-// span (whether reused or freshly chunked), so the caller can persist them as
-// the reference for the next run.
-type ReuseSinkFunc func(relPath string, size uint64, mtimeSecs uint64, digests []string)
+// PayloadReuseFunc, given a regular file's archive-relative path, size and mtime,
+// returns the payload chunks recorded for it by a previous backup (and true) when
+// the file is unchanged, so its bytes can be referenced without reading.
+// ok=false means "read and re-chunk the file".
+type PayloadReuseFunc func(relPath string, size uint64, mtimeSecs uint64) (chunks []ReusedChunk, ok bool)
+
+// ReuseSinkFunc records the payload chunks actually used for a file's span
+// (whether reused or freshly chunked), so the caller can persist them as the
+// reference for the next run.
+type ReuseSinkFunc func(relPath string, size uint64, mtimeSecs uint64, chunks []ReusedChunk)
+
+// ReuseHooks are the payload-stream operations the archive needs for reuse.
+// Implemented by the payload ChunkState so pxar.go stays free of chunker detail.
+type ReuseHooks struct {
+	// Break finalizes the current partial payload chunk so the next byte starts a
+	// fresh chunk, aligning file spans to chunk boundaries.
+	Break func() error
+	// BeginRecord/EndRecord capture the chunks emitted for a file span while it is
+	// read, so they can be recorded for next-run reuse.
+	BeginRecord func()
+	EndRecord   func() []ReusedChunk
+	// AssignKnown places already-existing chunks into the payload index at the
+	// current position without uploading, advancing the stream by their total
+	// length. Used to reuse an unchanged file's payload.
+	AssignKnown func(chunks []ReusedChunk) error
+}
 
 // MetaCollector is an optional hook invoked during the PXAR walk for every
 // directory and regular file that is actually being backed up (after skip
@@ -317,12 +342,18 @@ type PXARArchive struct {
 	// the file's path/size/mtime it may return the payload chunk digests recorded
 	// by a previous backup, letting us reference them without opening the file.
 	PayloadReuse PayloadReuseFunc
-	// ReuseSink receives, per regular file, the digests actually used for its
+	// ReuseSink receives, per regular file, the chunks actually used for its
 	// payload span (reused or freshly chunked) so the caller can persist them for
 	// the next run.
 	ReuseSink ReuseSinkFunc
-	reusedFiles int
-	readFiles   int
+	// Hooks are the payload-stream break/record/assign operations (set by the
+	// caller in split mode when reuse is enabled).
+	Hooks ReuseHooks
+	// ReuseThreshold: only files at least this large are span-aligned and eligible
+	// for reuse (smaller files are cheap to read and would bloat the chunk index).
+	ReuseThreshold uint64
+	reusedFiles    int
+	readFiles      int
 
 	catalog_pos  uint64
 	SkippedFiles []string // ALL skips (read errors, junctions, system auto-excludes) — for logging/sidecar display
@@ -429,6 +460,27 @@ func (a *PXARArchive) FinishSplit() error {
 // ReuseStats reports how many regular files had their payload reused vs read.
 func (a *PXARArchive) ReuseStats() (reused int, read int) {
 	return a.reusedFiles, a.readFiles
+}
+
+// writePayloadRef writes a PXAR_PAYLOAD_REF entry into the metadata stream,
+// pointing at the current payload-stream position (where this file's PXAR_PAYLOAD
+// header will be or was placed) and declaring its content size.
+func (a *PXARArchive) writePayloadRef(size uint64) error {
+	binary.Write(&a.buffer, binary.LittleEndian, PXAR_PAYLOAD_REF)
+	binary.Write(&a.buffer, binary.LittleEndian, uint64(32)) // full_size = 16 header + 16 PayloadRef
+	binary.Write(&a.buffer, binary.LittleEndian, a.payloadPos)
+	binary.Write(&a.buffer, binary.LittleEndian, size)
+	return a.Flush()
+}
+
+// relPath returns path relative to the archive root, slash-normalised — a stable
+// key across runs (independent of a VSS shadow-copy prefix) for the reuse state.
+func (a *PXARArchive) relPath(p string) string {
+	r, err := filepath.Rel(a.root, p)
+	if err != nil {
+		return filepath.ToSlash(p)
+	}
+	return filepath.ToSlash(r)
 }
 
 type CatalogDir struct {
@@ -818,32 +870,14 @@ func (a *PXARArchive) WriteFile(path string, basename string) (CatalogFile, erro
 		return CatalogFile{}, nil // Return nil error to continue backup
 	}
 
-	file, err := os.Open(path)
-
-	if err != nil {
-		// Log file open errors but continue backup - don't fail on locked/system files
-		skipMsg := fmt.Sprintf("Cannot open file: %s (Error: %v)", path, err)
-		a.addReadError(skipMsg)
-		return CatalogFile{}, nil
-	}
-
-	defer file.Close()
-
-	// Capture per-file metadata (NTFS ACLs on Windows). Best-effort.
-	if a.MetaCollector != nil {
-		if err := a.MetaCollector.Collect(path, fileInfo, false); err != nil {
-			a.SkippedFiles = append(a.SkippedFiles,
-				fmt.Sprintf("Metadata collect failed for file %s: %v", path, err))
-		}
-	}
-
+	// FILENAME + ENTRY (metadata) need only fileInfo, so they are written before
+	// the file is opened — an unchanged file can be reused without opening it,
+	// which also lets a locked-but-unchanged file still be backed up.
 	fname_entry := &PXARFilenameEntry{
 		hdr: PXAR_FILENAME,
 		len: uint64(16) + uint64(len(basename)) + 1,
 	}
-
 	binary.Write(&a.buffer, binary.LittleEndian, fname_entry)
-
 	a.buffer.WriteString(basename)
 	a.buffer.WriteByte(0x00)
 
@@ -862,6 +896,62 @@ func (a *PXARArchive) WriteFile(path string, basename string) (CatalogFile, erro
 	}
 	binary.Write(&a.buffer, binary.LittleEndian, entry)
 
+	declaredSizeEarly := uint64(fileInfo.Size())
+	mtimeSecs := uint64(fileInfo.ModTime().Unix())
+	relPath := a.relPath(path)
+	// Reuse-eligible = split mode with reuse wired and a file large enough that
+	// span-aligning it (a forced chunk break on each side) is worth the index cost.
+	eligible := a.Split && a.Hooks.AssignKnown != nil && declaredSizeEarly >= a.ReuseThreshold
+
+	if eligible {
+		// Align the payload stream to a chunk boundary so this file's span is whole
+		// chunks — required for both recording (read) and referencing (reuse).
+		if err := a.Hooks.Break(); err != nil {
+			return CatalogFile{}, err
+		}
+		if chunks, ok := a.PayloadReuse(relPath, declaredSizeEarly, mtimeSecs); ok {
+			// Unchanged: reference the previous run's payload chunks without opening
+			// or reading the file.
+			if err := a.writePayloadRef(declaredSizeEarly); err != nil {
+				return CatalogFile{}, err
+			}
+			if err := a.Hooks.AssignKnown(chunks); err != nil {
+				return CatalogFile{}, err
+			}
+			a.payloadPos += 16 + declaredSizeEarly // PXAR_PAYLOAD header + data
+			if a.ReuseSink != nil {
+				a.ReuseSink(relPath, declaredSizeEarly, mtimeSecs, chunks)
+			}
+			a.reusedFiles++
+			if err := a.Hooks.Break(); err != nil { // align next span
+				return CatalogFile{}, err
+			}
+			return CatalogFile{Name: basename, MTime: mtimeSecs, Size: declaredSizeEarly}, nil
+		}
+	}
+
+	file, err := os.Open(path)
+
+	if err != nil {
+		// Log file open errors but continue backup - don't fail on locked/system files
+		skipMsg := fmt.Sprintf("Cannot open file: %s (Error: %v)", path, err)
+		a.addReadError(skipMsg)
+		return CatalogFile{}, nil
+	}
+
+	defer file.Close()
+
+	// Capture per-file metadata (NTFS ACLs on Windows). Best-effort.
+	if a.MetaCollector != nil {
+		if err := a.MetaCollector.Collect(path, fileInfo, false); err != nil {
+			a.SkippedFiles = append(a.SkippedFiles,
+				fmt.Sprintf("Metadata collect failed for file %s: %v", path, err))
+		}
+	}
+	if eligible {
+		a.Hooks.BeginRecord()
+	}
+
 	// The PXAR stream is a flat byte sequence: the next entry's header begins
 	// immediately after exactly declaredSize payload bytes. We commit declaredSize
 	// in the header here, so we MUST emit exactly that many bytes regardless of how
@@ -869,7 +959,7 @@ func (a *PXARArchive) WriteFile(path string, basename string) (CatalogFile, erro
 	// and the read below (common for files in use WITHOUT VSS: logs, .pst, SQL .mdf)
 	// would otherwise desynchronise the whole archive and corrupt every entry that
 	// follows. So we cap reads at declaredSize and zero-pad any shortfall.
-	declaredSize := uint64(fileInfo.Size())
+	declaredSize := declaredSizeEarly
 
 	// Legacy: payload header + data are written inline into the metadata stream.
 	// Split (v2): the metadata stream gets a PAYLOAD_REF pointing at where the
@@ -880,11 +970,7 @@ func (a *PXARArchive) WriteFile(path string, basename string) (CatalogFile, erro
 	writeTarget := &a.buffer
 	flushFn := a.Flush
 	if a.Split {
-		binary.Write(&a.buffer, binary.LittleEndian, PXAR_PAYLOAD_REF)
-		binary.Write(&a.buffer, binary.LittleEndian, uint64(32)) // full_size = 16 header + 16 PayloadRef
-		binary.Write(&a.buffer, binary.LittleEndian, a.payloadPos) // offset into payload stream
-		binary.Write(&a.buffer, binary.LittleEndian, declaredSize) // payload content size
-		if err := a.Flush(); err != nil {
+		if err := a.writePayloadRef(declaredSize); err != nil {
 			return CatalogFile{}, err
 		}
 		writeTarget = &a.payloadBuffer
@@ -957,6 +1043,18 @@ func (a *PXARArchive) WriteFile(path string, basename string) (CatalogFile, erro
 
 	if err := flushFn(); err != nil {
 		return CatalogFile{}, err
+	}
+
+	if eligible {
+		// Close the span at a chunk boundary and record the chunks it produced so
+		// the next run can reuse this file if it is unchanged.
+		if err := a.Hooks.Break(); err != nil {
+			return CatalogFile{}, err
+		}
+		chunks := a.Hooks.EndRecord()
+		if a.ReuseSink != nil {
+			a.ReuseSink(relPath, declaredSize, mtimeSecs, chunks)
+		}
 	}
 
 	return CatalogFile{
