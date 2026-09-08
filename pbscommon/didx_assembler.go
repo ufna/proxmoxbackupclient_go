@@ -27,6 +27,34 @@ const (
 // re-uploads all chunks (correct, just without dedup). This replaces the ad-hoc
 // previousDidx[4096:] slicing that panicked on a truncated or odd-length transfer
 // (and on a sub-8-byte 404 body).
+// ParsePreviousDIDXChunks parses a .didx into an ordered chunk list with each
+// chunk's digest AND byte length (derived from the cumulative end-offsets), so
+// the chunks can be re-referenced in a new index via AssignKnown — the basis of
+// the metadata fast path (reference an unchanged archive without reading it).
+func ParsePreviousDIDXChunks(previousDidx []byte) []ReusedChunk {
+	if len(previousDidx) < didxHeaderSize || !bytes.HasPrefix(previousDidx, didxMagic) {
+		return nil
+	}
+	entries := previousDidx[didxHeaderSize:]
+	if len(entries)%didxEntrySize != 0 {
+		return nil
+	}
+	out := make([]ReusedChunk, 0, len(entries)/didxEntrySize)
+	var prevEnd uint64
+	for base := 0; base < len(entries); base += didxEntrySize {
+		end := binary.LittleEndian.Uint64(entries[base : base+8])
+		if end < prevEnd {
+			return nil // corrupt / non-monotonic
+		}
+		out = append(out, ReusedChunk{
+			Digest: hex.EncodeToString(entries[base+8 : base+40]),
+			Length: end - prevEnd,
+		})
+		prevEnd = end
+	}
+	return out
+}
+
 func ParsePreviousDIDXChunkDigests(previousDidx []byte) []string {
 	if len(previousDidx) < didxHeaderSize || !bytes.HasPrefix(previousDidx, didxMagic) {
 		return nil
