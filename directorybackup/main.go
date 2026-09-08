@@ -10,6 +10,7 @@ import (
 	"hash"
 	"io"
 	"os"
+	"path/filepath"
 	"pbscommon"
 	"runtime"
 	"snapshot"
@@ -279,8 +280,10 @@ func main() {
 
 	begin := time.Now()
 	var readErrors []string
-	if cfg.BackupSourceDir != "" {
-		readErrors, err = backup(client, newchunk, reusechunk, cfg.PxarOut, cfg.BackupSourceDir, cfg.UseVSS, cfg.Split, cfg.StatePath)
+	if len(cfg.Archives) > 0 {
+		readErrors, err = backup_multi(client, newchunk, reusechunk, cfg.Archives, cfg.UseVSS)
+	} else if cfg.BackupSourceDir != "" {
+		readErrors, err = backup(client, newchunk, reusechunk, cfg.PxarOut, cfg.BackupSourceDir, cfg.UseVSS, cfg.Split, cfg.StatePath, cfg.SeedSnapshot, cfg.SeedArchives)
 	} else if cfg.BackupStreamName != "" {
 		sn := cfg.BackupStreamName
 		if !strings.HasSuffix(sn, ".didx") {
@@ -435,9 +438,68 @@ func backup_stream(client *pbscommon.PBSClient, newchunk, reusechunk *atomic.Uin
 // previous snapshot's indexes avoids re-uploading unchanged data. With a state
 // file, PayloadReuse additionally skips re-READING unchanged files (see
 // reuse_state.go).
-func backup_real_split(client *pbscommon.PBSClient, newchunk, reusechunk *atomic.Uint64, backupdir string, statePath string) ([]string, error) {
-	client.Connect(false, "host")
+// seedKnownChunks opens a reader session to an existing snapshot and loads the
+// chunk digests of the given archive indexes into knownChunks, so a subsequent
+// content-defined backup references those chunks instead of re-uploading them.
+// This is what lets a fresh agent backup dedup against the existing pull backup
+// (verified: the Go and Rust chunkers produce identical boundaries).
+// snapshot is "type/id/ts" e.g. "host/win7/2026-09-02T18:52:10Z".
+func seedKnownChunks(client *pbscommon.PBSClient, snapshot, archivesCsv string, knownChunks *haxmap.Map[string, bool]) (int, error) {
+	parts := strings.Split(snapshot, "/")
+	if len(parts) != 3 {
+		return 0, fmt.Errorf("bad -seed-snapshot %q (want type/id/ts)", snapshot)
+	}
+	t, err := time.Parse("2006-01-02T15:04:05Z", parts[2])
+	if err != nil {
+		return 0, fmt.Errorf("bad seed timestamp %q: %w", parts[2], err)
+	}
+	// A SEPARATE reader client, so the backup client's session/state is untouched.
+	rc := &pbscommon.PBSClient{
+		BaseURL: client.BaseURL, CertFingerPrint: client.CertFingerPrint,
+		AuthID: client.AuthID, Secret: client.Secret,
+		Username: client.Username, Password: client.Password,
+		Ticket: client.Ticket, CSRFToken: client.CSRFToken,
+		Datastore: client.Datastore, Namespace: client.Namespace,
+		Insecure: client.Insecure,
+	}
+	rc.Manifest.BackupType, rc.Manifest.BackupID, rc.Manifest.BackupTime = parts[0], parts[1], t.Unix()
+	rc.Connect(true, parts[0]) // reader session on the seed snapshot
+	defer rc.Close()
+	total := 0
+	for _, a := range strings.Split(archivesCsv, ",") {
+		a = strings.TrimSpace(a)
+		if a == "" {
+			continue
+		}
+		data, err := rc.DownloadToBytes(a)
+		if err != nil {
+			return total, fmt.Errorf("seed download %s: %w", a, err)
+		}
+		for _, d := range pbscommon.ParsePreviousDIDXChunkDigests(data) {
+			if _, existed := knownChunks.GetOrSet(d, true); !existed {
+				total++
+			}
+		}
+	}
+	return total, nil
+}
+
+func backup_real_split(client *pbscommon.PBSClient, newchunk, reusechunk *atomic.Uint64, backupdir string, statePath, seedSnapshot, seedArchives string) ([]string, error) {
 	knownChunks := haxmap.New[string, bool]()
+
+	// Seed from an existing snapshot (e.g. the pull backup) over a reader session
+	// BEFORE opening the backup session — a content-defined backup then references
+	// those chunks instead of re-uploading them. Done first so it does not disturb
+	// the writer connection.
+	if seedSnapshot != "" && seedArchives != "" {
+		n, err := seedKnownChunks(client, seedSnapshot, seedArchives, knownChunks)
+		if err != nil {
+			return nil, fmt.Errorf("seeding from %s: %w", seedSnapshot, err)
+		}
+		fmt.Printf("Seeded %d known chunks from %s [%s]\n", n, seedSnapshot, seedArchives)
+	}
+
+	client.Connect(false, "host")
 
 	const mpxarName = "backup.mpxar.didx"
 	const ppxarName = "backup.ppxar.didx"
@@ -478,29 +540,36 @@ func backup_real_split(client *pbscommon.PBSClient, newchunk, reusechunk *atomic
 	// re-read. Guarded so we only ever reference chunks the previous snapshot still
 	// holds (seeded into knownChunks) — a stale state can cause a re-read, never a
 	// dangling reference.
+	// With -state: file-aligned chunking + skip-read reuse (best when READING is the
+	// bottleneck — slow/remote source). Without -state: plain content-defined
+	// chunking like the PBS/Rust client (best when UPLOAD is the bottleneck and the
+	// data already exists in the datastore under a compatible chunking — dedups
+	// against it, at the cost of re-reading locally, which is cheap on-machine).
 	state := LoadReuseState(statePath)
 	newState := NewReuseState()
-	archive.ReuseThreshold = 1024 * 1024 // 1 MiB — below this, reading is cheap
-	archive.Hooks = pbscommon.ReuseHooks{
-		Break:       func() error { return ppxarChunk.Break(client) },
-		BeginRecord: ppxarChunk.BeginRecord,
-		EndRecord:   ppxarChunk.EndRecord,
-		AssignKnown: ppxarChunk.AssignKnown,
-	}
-	archive.PayloadReuse = func(rel string, size, mtime uint64) ([]pbscommon.ReusedChunk, bool) {
-		chunks, ok := state.Lookup(rel, size, mtime)
-		if !ok {
-			return nil, false
+	if statePath != "" {
+		archive.ReuseThreshold = 1024 * 1024 // 1 MiB — below this, reading is cheap
+		archive.Hooks = pbscommon.ReuseHooks{
+			Break:       func() error { return ppxarChunk.Break(client) },
+			BeginRecord: ppxarChunk.BeginRecord,
+			EndRecord:   ppxarChunk.EndRecord,
+			AssignKnown: ppxarChunk.AssignKnown,
 		}
-		for _, ch := range chunks {
-			if _, exists := knownChunks.Get(ch.Digest); !exists {
-				return nil, false // previous snapshot no longer has it — re-read
+		archive.PayloadReuse = func(rel string, size, mtime uint64) ([]pbscommon.ReusedChunk, bool) {
+			chunks, ok := state.Lookup(rel, size, mtime)
+			if !ok {
+				return nil, false
 			}
+			for _, ch := range chunks {
+				if _, exists := knownChunks.Get(ch.Digest); !exists {
+					return nil, false // previous snapshot no longer has it — re-read
+				}
+			}
+			return chunks, true
 		}
-		return chunks, true
-	}
-	archive.ReuseSink = func(rel string, size, mtime uint64, chunks []pbscommon.ReusedChunk) {
-		newState.Record(rel, size, mtime, chunks)
+		archive.ReuseSink = func(rel string, size, mtime uint64, chunks []pbscommon.ReusedChunk) {
+			newState.Record(rel, size, mtime, chunks)
+		}
 	}
 
 	archive.WriteCB = func(b []byte) error { return mpxarChunk.HandleData(b, client) }
@@ -531,9 +600,120 @@ func backup_real_split(client *pbscommon.PBSClient, newchunk, reusechunk *atomic
 	return archive.ReadErrors, nil
 }
 
-func backup_real(client *pbscommon.PBSClient, newchunk, reusechunk *atomic.Uint64, pxarOut string, backupdir string, split bool, statePath string) ([]string, error) {
+// backup_multi_real backs up several directories as separate archive pairs
+// (<name>.mpxar/<name>.ppxar) in ONE snapshot, content-defined. When the
+// backup-id and archive names match an existing backup (the pull), each
+// archive's own /previous registers those chunks server-side, so unchanged data
+// is referenced instead of re-uploaded — this is how we reuse the pull's 850 GB.
+func backup_multi_real(client *pbscommon.PBSClient, newchunk, reusechunk *atomic.Uint64, archives []ArchiveSpec) ([]string, error) {
+	client.Connect(false, "host")
+	knownChunks := haxmap.New[string, bool]()
+	var readErrors []string
+
+	for _, a := range archives {
+		mpxar := a.Name + ".mpxar.didx"
+		ppxar := a.Name + ".ppxar.didx"
+
+		// Native per-archive /previous: downloads the previous snapshot's index
+		// for THIS (backup-id, archive) AND registers those chunks in the server
+		// session, so they can be referenced without re-upload.
+		before := knownChunks.Len()
+		for _, n := range []string{mpxar, ppxar} {
+			prev, err := client.DownloadPreviousToBytes(n)
+			if err != nil {
+				return readErrors, fmt.Errorf("previous %s: %w", n, err)
+			}
+			for _, d := range pbscommon.ParsePreviousDIDXChunkDigests(prev) {
+				knownChunks.Set(d, true)
+			}
+		}
+		fmt.Printf("Archive %s: seeded %d known chunks from previous\n", a.Name, knownChunks.Len()-before)
+
+		mp := ChunkState{}
+		mp.Init(newchunk, reusechunk, knownChunks)
+		pp := ChunkState{}
+		pp.Init(newchunk, reusechunk, knownChunks)
+
+		var err error
+		if mp.wrid, err = client.CreateDynamicIndex(mpxar); err != nil {
+			return readErrors, err
+		}
+		if pp.wrid, err = client.CreateDynamicIndex(ppxar); err != nil {
+			return readErrors, err
+		}
+
+		archive := &pbscommon.PXARArchive{}
+		archive.Split = true // content-defined (no reuse hooks) — matches the pull's chunking
+		archive.ArchiveName = mpxar
+		archive.WriteCB = func(b []byte) error { return mp.HandleData(b, client) }
+		archive.PayloadWriteCB = func(b []byte) error { return pp.HandleData(b, client) }
+
+		if _, err = archive.WriteDir(a.Dir, "", true); err != nil {
+			return readErrors, fmt.Errorf("archive %s (%s): %w", a.Name, a.Dir, err)
+		}
+		if err = archive.FinishSplit(); err != nil {
+			return readErrors, err
+		}
+		if err = mp.Eof(client); err != nil {
+			return readErrors, err
+		}
+		if err = pp.Eof(client); err != nil {
+			return readErrors, err
+		}
+		readErrors = append(readErrors, archive.ReadErrors...)
+	}
+
+	if err := client.UploadManifest(); err != nil {
+		return readErrors, err
+	}
+	return readErrors, nil
+}
+
+// backup_multi wraps backup_multi_real with VSS (one shadow per source volume)
+// and the final commit.
+func backup_multi(client *pbscommon.PBSClient, newchunk, reusechunk *atomic.Uint64, archives []ArchiveSpec, usevss bool) ([]string, error) {
+	var readErrors []string
+	var err error
+	if usevss {
+		dirs := make([]string, len(archives))
+		for i, a := range archives {
+			dirs[i] = a.Dir
+		}
+		err = snapshot.CreateVSSSnapshot(dirs, func(snaps map[string]snapshot.SnapShot) error {
+			remapped := make([]ArchiveSpec, len(archives))
+			for i, a := range archives {
+				remapped[i] = ArchiveSpec{Dir: remapToShadow(a.Dir, snaps), Name: a.Name}
+			}
+			var e error
+			readErrors, e = backup_multi_real(client, newchunk, reusechunk, remapped)
+			return e
+		})
+	} else {
+		readErrors, err = backup_multi_real(client, newchunk, reusechunk, archives)
+	}
+	if err != nil {
+		return readErrors, err
+	}
+	return readErrors, client.Finish()
+}
+
+// remapToShadow rewrites a source dir onto its VSS shadow copy. CreateVSSSnapshot
+// keys the map by filepath.Abs(dir) with FullPath = the shadow path (on Linux the
+// nop keeps FullPath == dir).
+func remapToShadow(dir string, snaps map[string]snapshot.SnapShot) string {
+	abs, _ := filepath.Abs(dir)
+	if s, ok := snaps[abs]; ok && s.FullPath != "" {
+		return s.FullPath
+	}
+	if s, ok := snaps[dir]; ok && s.FullPath != "" {
+		return s.FullPath
+	}
+	return dir
+}
+
+func backup_real(client *pbscommon.PBSClient, newchunk, reusechunk *atomic.Uint64, pxarOut string, backupdir string, split bool, statePath, seedSnapshot, seedArchives string) ([]string, error) {
 	if split {
-		return backup_real_split(client, newchunk, reusechunk, backupdir, statePath)
+		return backup_real_split(client, newchunk, reusechunk, backupdir, statePath, seedSnapshot, seedArchives)
 	}
 	client.Connect(false, "host")
 	knownChunks := haxmap.New[string, bool]()
@@ -636,7 +816,7 @@ func backup_real(client *pbscommon.PBSClient, newchunk, reusechunk *atomic.Uint6
 	return archive.ReadErrors, nil
 }
 
-func backup(client *pbscommon.PBSClient, newchunk, reusechunk *atomic.Uint64, pxarOut string, backupdir string, usevss bool, split bool, statePath string) ([]string, error) {
+func backup(client *pbscommon.PBSClient, newchunk, reusechunk *atomic.Uint64, pxarOut string, backupdir string, usevss bool, split bool, statePath, seedSnapshot, seedArchives string) ([]string, error) {
 
 	fmt.Printf("Starting backup of %s\n", backupdir)
 	var err error
@@ -650,12 +830,12 @@ func backup(client *pbscommon.PBSClient, newchunk, reusechunk *atomic.Uint64, px
 			}
 			//Remove VSS snapshot on windows, on linux for now NOP
 			var e error
-			readErrors, e = backup_real(client, newchunk, reusechunk, pxarOut, backupdir, split, statePath)
+			readErrors, e = backup_real(client, newchunk, reusechunk, pxarOut, backupdir, split, statePath, seedSnapshot, seedArchives)
 			return e
 
 		})
 	} else {
-		readErrors, err = backup_real(client, newchunk, reusechunk, pxarOut, backupdir, split, statePath)
+		readErrors, err = backup_real(client, newchunk, reusechunk, pxarOut, backupdir, split, statePath, seedSnapshot, seedArchives)
 	}
 
 	if err != nil {

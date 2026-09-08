@@ -27,31 +27,44 @@ type SMTPConfig struct {
 	Template *MailTemplate    `json:"template"`
 }
 
+// ArchiveSpec is one folder → archive-base mapping for multi-archive mode.
+type ArchiveSpec struct {
+	Dir  string `json:"dir"`  // source directory, e.g. H:\Pictures
+	Name string `json:"name"` // archive base, e.g. h-pictures (-> h-pictures.mpxar/ppxar)
+}
+
 type Config struct {
-	BaseURL          string      `json:"baseurl"`
-	CertFingerprint  string      `json:"certfingerprint"`
-	AuthID           string      `json:"authid"`
-	Secret           string      `json:"secret"`
-	PBSUsername      string      `json:"pbs-username"`
-	PBSPassword      string      `json:"pbs-password"`
-	Datastore        string      `json:"datastore"`
-	Namespace        string      `json:"namespace"`
-	BackupID         string      `json:"backup-id"`
-	BackupSourceDir  string      `json:"backupdir"`
-	BackupStreamName string      `json:"backupstreamname"`
-	PxarOut          string      `json:"pxarout"`
-	Keyfile          string      `json:"keyfile"`
-	Split            bool        `json:"split"`
-	StatePath        string      `json:"state"`
-	SMTP             *SMTPConfig `json:"smtp"`
-	UseVSS           bool        `json:"usevss"`
+	BaseURL          string `json:"baseurl"`
+	CertFingerprint  string `json:"certfingerprint"`
+	AuthID           string `json:"authid"`
+	Secret           string `json:"secret"`
+	PBSUsername      string `json:"pbs-username"`
+	PBSPassword      string `json:"pbs-password"`
+	Datastore        string `json:"datastore"`
+	Namespace        string `json:"namespace"`
+	BackupID         string `json:"backup-id"`
+	BackupSourceDir  string `json:"backupdir"`
+	BackupStreamName string `json:"backupstreamname"`
+	PxarOut          string `json:"pxarout"`
+	Keyfile          string `json:"keyfile"`
+	Split            bool   `json:"split"`
+	StatePath        string `json:"state"`
+	SeedSnapshot     string `json:"seed-snapshot"`
+	SeedArchives     string `json:"seed-archives"`
+	// Archives: multi-archive mode. Each dir becomes an archive pair
+	// <name>.mpxar/<name>.ppxar in ONE snapshot (like the pull's h-* layout).
+	// With backup-id matching the pull, per-archive /previous makes the first run
+	// dedup against the existing pull backup instead of re-uploading it.
+	Archives []ArchiveSpec `json:"archives"`
+	SMTP     *SMTPConfig   `json:"smtp"`
+	UseVSS   bool          `json:"usevss"`
 }
 
 func (c *Config) valid() bool {
 	// Authentication is either an API token (authid+secret) or a PBS
 	// username+password (ticket login). Exactly one of the two must be set.
 	authOK := (c.AuthID != "" && c.Secret != "") || (c.PBSUsername != "" && c.PBSPassword != "")
-	baseValid := c.BaseURL != "" && authOK && c.Datastore != "" && (c.BackupSourceDir != "" || c.BackupStreamName != "")
+	baseValid := c.BaseURL != "" && authOK && c.Datastore != "" && (c.BackupSourceDir != "" || c.BackupStreamName != "" || len(c.Archives) > 0)
 	if !baseValid {
 		return baseValid
 	}
@@ -87,6 +100,8 @@ func loadConfig() *Config {
 	keyfileFlag := flag.String("keyfile", "", "Path to a PBS encryption keyfile (kdf=none JSON). When set, chunks are AES-256-GCM encrypted client-side (crypt-mode=encrypt).")
 	splitFlag := flag.Bool("split", false, "Use split-archive format v2 (.mpxar/.ppxar). Enables metadata-based incremental: with -state, unchanged files are not re-read.")
 	stateFlag := flag.String("state", "", "Path to a local reuse-state file (JSON). With -split, records per-file payload chunk digests so the next run can skip re-reading unchanged files.")
+	seedSnapshotFlag := flag.String("seed-snapshot", "", "Seed known-chunks from an existing snapshot before backing up, e.g. host/win7/2026-09-02T18:52:10Z. Content-defined chunking then references its chunks instead of re-uploading (dedup against an existing backup).")
+	seedArchivesFlag := flag.String("seed-archives", "", "Comma-separated archive index names to seed from -seed-snapshot, e.g. h-pictures.ppxar.didx.")
 	noVSSFlag := flag.Bool("novss", false, "Disable VSS ( For filesystems that don't support it, for example veracrypt )")
 
 	mailHostFlag := flag.String("mail-host", "", "mail notification system: mail server host(optional)")
@@ -165,6 +180,12 @@ func loadConfig() *Config {
 	}
 	if *stateFlag != "" {
 		config.StatePath = *stateFlag
+	}
+	if *seedSnapshotFlag != "" {
+		config.SeedSnapshot = *seedSnapshotFlag
+	}
+	if *seedArchivesFlag != "" {
+		config.SeedArchives = *seedArchivesFlag
 	}
 	if *noVSSFlag {
 		config.UseVSS = false
