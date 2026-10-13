@@ -5,6 +5,9 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
+
+	"snapshot"
 )
 
 type MailSendConfig struct {
@@ -103,6 +106,7 @@ func loadConfig() *Config {
 	seedSnapshotFlag := flag.String("seed-snapshot", "", "Seed known-chunks from an existing snapshot before backing up, e.g. host/win7/2026-09-02T18:52:10Z. Content-defined chunking then references its chunks instead of re-uploading (dedup against an existing backup).")
 	seedArchivesFlag := flag.String("seed-archives", "", "Comma-separated archive index names to seed from -seed-snapshot, e.g. h-pictures.ppxar.didx.")
 	noVSSFlag := flag.Bool("novss", false, "Disable VSS ( For filesystems that don't support it, for example veracrypt )")
+	vssDeleteFlag := flag.String("vss-delete-shadows", "", "Maintenance: delete the given comma-separated VSS shadow-copy IDs via the VSS API, then exit")
 
 	mailHostFlag := flag.String("mail-host", "", "mail notification system: mail server host(optional)")
 	mailPortFlag := flag.String("mail-port", "", "mail notification system: mail server port(optional)")
@@ -118,6 +122,29 @@ func loadConfig() *Config {
 
 	// Parse command line flags
 	flag.Parse()
+
+	// Maintenance sweep: delete specific shadow copies and exit (iwgw.4 — the
+	// only working delete path for our VSS_CTX_BACKUP shadows is the API).
+	if *vssDeleteFlag != "" {
+		ids := []string{}
+		for _, id := range strings.Split(*vssDeleteFlag, ",") {
+			if id = strings.TrimSpace(id); id != "" {
+				ids = append(ids, id)
+			}
+		}
+		failed := snapshot.DeleteShadowsByID(ids)
+		for _, id := range ids {
+			if err, bad := failed[id]; bad {
+				fmt.Printf("VSS delete %s: %v\n", id, err)
+			} else {
+				fmt.Printf("VSS delete %s: OK\n", id)
+			}
+		}
+		if len(failed) > 0 {
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
 
 	config := &Config{
 		UseVSS: true,

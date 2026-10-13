@@ -20,3 +20,7 @@ func CreateVSSSnapshot(paths []string, backup_callback func(sn map[string]SnapSh
 func VSSCleanup() error {
 	return nil
 }
+
+func DeleteShadowsByID(ids []string) map[string]error {
+	return nil
+}

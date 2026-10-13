@@ -12,11 +12,44 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/go-ole/go-ole"
 	"github.com/st-matskevich/go-vss"
 )
 
 // shadowIDRe matches a bare VSS shadow-copy GUID (8-4-4-4-12 hex).
 var shadowIDRe = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
+
+// DeleteShadowsByID deletes shadow copies through the VSS API itself
+// (IVssBackupComponents.DeleteSnapshots). Returns per-id failures (an id absent
+// from the map means deleted OK). This is the ONLY working path for shadows
+// this client creates: they use VSS_CTX_BACKUP (auto-release on requestor
+// release), and win7's vssadmin answers "no items found" for them — they are
+// manageable by their requestor application only; WMI's Win32_ShadowCopy does
+// not even list them (verified on win7 2026-10-13).
+func DeleteShadowsByID(ids []string) map[string]error {
+	failed := map[string]error{}
+	ole.CoInitialize(0)
+	defer ole.CoUninitialize()
+	comps, err := vss.LoadAndInitVSS()
+	if err != nil {
+		for _, id := range ids {
+			failed[id] = fmt.Errorf("init VSS: %w", err)
+		}
+		return failed
+	}
+	defer comps.Release()
+	for _, id := range ids {
+		guid := ole.NewGUID(id)
+		if guid == nil {
+			failed[id] = fmt.Errorf("bad shadow id")
+			continue
+		}
+		if _, _, err := comps.DeleteSnapshots(*guid); err != nil {
+			failed[id] = err
+		}
+	}
+	return failed
+}
 
 // normalizeShadowID strips optional braces and validates a VSS shadow ID,
 // returning the bare GUID or "" if the name is not shadow-id-shaped.
@@ -80,7 +113,11 @@ func CreateVSSSnapshot(paths []string, backup_callback func(sn map[string]SnapSh
 	snapshotters := make([]*vss.Snapshotter, 0, len(paths))
 	defer func() {
 		for _, s := range snapshotters {
-			s.Release()
+			// Release should auto-delete the shadow (VSS_CTX_BACKUP); log when it
+			// fails — the leftover is then swept by VSSCleanup on the next start.
+			if rerr := s.Release(); rerr != nil {
+				fmt.Printf("WARNING: VSS release failed (shadow may leak until next run's cleanup): %v\n", rerr)
+			}
 		}
 	}()
 	snapshots := make(map[string]SnapShot)
@@ -198,10 +235,10 @@ func CreateVSSSnapshot(paths []string, backup_callback func(sn map[string]SnapSh
 // Best-effort by design: the worst case here is that an orphan remains until a
 // later run, which is far safer than wiping other applications' shadow copies.
 //
-// WINDOWS-VERIFY: the exact `vssadmin delete shadows /shadow={id}` form may
-// require `/for=<volume>` on some Windows versions; we do not persist the source
-// volume. The robust long-term path is the VSS API DeleteSnapshots(by ID). If the
-// invocation is rejected, the orphan simply remains (no collateral damage).
+// Deletion goes through the VSS API (DeleteShadowByID): win7's vssadmin cannot
+// see our VSS_CTX_BACKUP shadows ("no items found", verified 2026-10-13 — the
+// reason the cleanup originally appeared to do nothing). If the API delete is
+// rejected, the orphan simply remains (no collateral damage).
 func VSSCleanup() error {
 	appData, err := getAppDataFolder()
 	if err != nil {
@@ -215,6 +252,8 @@ func VSSCleanup() error {
 		return nil
 	}
 
+	liveIDs := []string{}
+	liveMarkers := map[string]string{}
 	for _, e := range entries {
 		id := normalizeShadowID(e.Name())
 		if id == "" {
@@ -231,15 +270,31 @@ func VSSCleanup() error {
 		}
 
 		// Live symlink ⇒ the shadow still exists ⇒ a genuine orphan from a crash.
-		fmt.Printf("VSS Cleanup: removing orphaned Proxmox Backup Client shadow %s...\n", id)
-		deleteCmd := exec.Command("vssadmin", "delete", "shadows", "/shadow={"+id+"}", "/quiet")
-		if out, derr := deleteCmd.CombinedOutput(); derr != nil {
-			// Keep the marker so a later run retries; never fall back to /all.
-			fmt.Printf("VSS Cleanup: could not delete shadow %s (best-effort, will retry): %v - %s\n", id, derr, string(out))
+		liveIDs = append(liveIDs, id)
+		liveMarkers[id] = marker
+	}
+
+	if len(liveIDs) == 0 {
+		return nil
+	}
+	fmt.Printf("VSS Cleanup: removing %d orphaned Proxmox Backup Client shadow(s)...\n", len(liveIDs))
+	failed := DeleteShadowsByID(liveIDs)
+	for _, id := range liveIDs {
+		if err, bad := failed[id]; bad {
+			// OBJECT_NOT_FOUND: the shadow is already gone (phantom catalog
+			// entry / wedged VSS state) — the goal is achieved, drop the marker
+			// instead of retrying (and logging) forever.
+			if strings.Contains(err.Error(), "VSS_E_OBJECT_NOT_FOUND") {
+				fmt.Printf("VSS Cleanup: shadow %s already gone, dropping marker\n", id)
+				_ = os.Remove(liveMarkers[id])
+				continue
+			}
+			// Keep the marker so a later run retries.
+			fmt.Printf("VSS Cleanup: could not delete shadow %s (best-effort, will retry): %v\n", id, err)
 			continue
 		}
 		fmt.Printf("VSS Cleanup: removed Proxmox Backup Client shadow %s\n", id)
-		_ = os.Remove(marker)
+		_ = os.Remove(liveMarkers[id])
 	}
 
 	// NOTE: we deliberately do NOT bounce the Windows VSS service here.

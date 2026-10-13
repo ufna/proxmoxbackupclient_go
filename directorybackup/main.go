@@ -274,9 +274,12 @@ func (c *ChunkState) Eof(client *pbscommon.PBSClient) error {
 	if err := c.drainUploads(); err != nil {
 		return err
 	}
-	//Avoid incurring in request entity too large by chunking assignment PUT requests in blocks of at most 128 chunks
-	for k := 0; k < len(c.assignments); k += 128 {
-		k2 := k + 128
+	// Chunk the assignment PUTs to avoid request-entity-too-large. 1024 per batch:
+	// ~85 KB of JSON each — still small, and 8x fewer RTTs than 128 (each PUT is
+	// a synchronous round trip; at ~250 ms on the win7->PBS path a 340k-chunk
+	// archive cost ~11 min in assignments alone).
+	for k := 0; k < len(c.assignments); k += 1024 {
+		k2 := k + 1024
 		if k2 > len(c.assignments) {
 			k2 = len(c.assignments)
 		}
@@ -700,6 +703,38 @@ func backup_real_split(client *pbscommon.PBSClient, newchunk, reusechunk *atomic
 	return archive.ReadErrors, nil
 }
 
+// Progress heartbeat (iwgw.5): once a minute the run prints where it sits —
+// archive, files reused/read, payload bytes, chunk counters — so a long run in
+// run.log is visibly alive (previously liveness was diagnosed via tunnel byte
+// counters on the Pi).
+var progArchive atomic.Value // string: archive currently being processed
+var progFilesReused atomic.Uint64
+var progFilesRead atomic.Uint64
+var progPayloadBytes atomic.Uint64
+
+func startProgressTicker(newchunk, reusechunk *atomic.Uint64, start time.Time) chan struct{} {
+	stop := make(chan struct{})
+	go func() {
+		t := time.NewTicker(60 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-t.C:
+				arch, _ := progArchive.Load().(string)
+				fmt.Printf("progress: archive=%s files=%d (reused %d / read %d) payload=%.2f GB chunks new=%d reused=%d elapsed=%s\n",
+					arch, progFilesReused.Load()+progFilesRead.Load(),
+					progFilesReused.Load(), progFilesRead.Load(),
+					float64(progPayloadBytes.Load())/(1024*1024*1024),
+					newchunk.Load(), reusechunk.Load(),
+					time.Since(start).Round(time.Second))
+			}
+		}
+	}()
+	return stop
+}
+
 // backup_multi_real backs up several directories as separate archive pairs
 // (<name>.mpxar/<name>.ppxar) in ONE snapshot, content-defined. When the
 // backup-id and archive names match an existing backup (the pull), each
@@ -719,6 +754,9 @@ func backup_multi_real(client *pbscommon.PBSClient, newchunk, reusechunk *atomic
 	knownChunks := haxmap.New[string, bool]()
 	var readErrors []string
 
+	progStop := startProgressTicker(newchunk, reusechunk, time.Now())
+	defer close(progStop)
+
 	state := LoadSigState(statePath)
 	// Start from a clone of the loaded state: archives not reached by a crashed
 	// run keep their previous sigs+spans, and only completed archives overwrite
@@ -734,6 +772,11 @@ func backup_multi_real(client *pbscommon.PBSClient, newchunk, reusechunk *atomic
 	}
 
 	for _, a := range archives {
+		progArchive.Store(a.Name)
+		progFilesReused.Store(0)
+		progFilesRead.Store(0)
+		progPayloadBytes.Store(0)
+
 		mpxar := a.Name + ".mpxar.didx"
 		ppxar := a.Name + ".ppxar.didx"
 
@@ -824,20 +867,26 @@ func backup_multi_real(client *pbscommon.PBSClient, newchunk, reusechunk *atomic
 		archive.PayloadReuse = func(rel string, size, mtime uint64) ([]pbscommon.ReusedChunk, bool) {
 			fs, ok := prevFiles[rel]
 			if !ok || fs.Size != size || fs.Mtime != mtime || len(fs.Chunks) == 0 {
+				progFilesRead.Add(1)
 				return nil, false
 			}
 			for _, ch := range fs.Chunks {
 				if _, exists := knownChunks.Get(ch.Digest); !exists {
+					progFilesRead.Add(1)
 					return nil, false // previous snapshot no longer has it — re-read
 				}
 			}
+			progFilesReused.Add(1)
 			return fs.Chunks, true
 		}
 		archive.ReuseSink = func(rel string, size, mtime uint64, chunks []pbscommon.ReusedChunk) {
 			newFiles[rel] = fileState{Size: size, Mtime: mtime, Chunks: chunks}
 		}
 		archive.WriteCB = func(b []byte) error { return mp.HandleData(b, client) }
-		archive.PayloadWriteCB = func(b []byte) error { return pp.HandleData(b, client) }
+		archive.PayloadWriteCB = func(b []byte) error {
+			progPayloadBytes.Add(uint64(len(b)))
+			return pp.HandleData(b, client)
+		}
 		if _, err = archive.WriteDir(a.Dir, "", true); err != nil {
 			return readErrors, fmt.Errorf("archive %s (%s): %w", a.Name, a.Dir, err)
 		}
@@ -880,9 +929,22 @@ func backup_multi(client *pbscommon.PBSClient, newchunk, reusechunk *atomic.Uint
 	var readErrors []string
 	var err error
 	if usevss {
-		dirs := make([]string, len(archives))
-		for i, a := range archives {
-			dirs[i] = a.Dir
+		// Drop our own orphaned shadows left by a crashed/killed previous run
+		// (iwgw.4) before building a fresh set — best-effort, only shadows this
+		// client created (recorded in the appData VSS symlink dir).
+		_ = snapshot.VSSCleanup()
+		// One shadow per unique source VOLUME, not per archive: 9 archives on
+		// the same volume used to create 9 shadows (~8 s of VSS time each) and
+		// 9 orphans per crash. remapToShadow resolves each archive dir through
+		// its volume's shadow.
+		volSeen := map[string]bool{}
+		var dirs []string
+		for _, a := range archives {
+			vol := strings.ToUpper(filepath.VolumeName(a.Dir)) + "\\"
+			if vol != "\\" && !volSeen[vol] {
+				volSeen[vol] = true
+				dirs = append(dirs, vol)
+			}
 		}
 		err = snapshot.CreateVSSSnapshot(dirs, func(snaps map[string]snapshot.SnapShot) error {
 			remapped := make([]ArchiveSpec, len(archives))
@@ -912,6 +974,16 @@ func remapToShadow(dir string, snaps map[string]snapshot.SnapShot) string {
 	}
 	if s, ok := snaps[dir]; ok && s.FullPath != "" {
 		return s.FullPath
+	}
+	// Volume-rooted snapshots (multi-archive dedupe): resolve through the shadow
+	// of this dir's volume plus the intra-volume remainder.
+	if vn := filepath.VolumeName(abs); vn != "" {
+		vol := strings.ToUpper(vn) + "\\"
+		for key, s := range snaps {
+			if strings.ToUpper(key) == vol && s.FullPath != "" {
+				return filepath.Join(s.FullPath, abs[len(vn)+1:])
+			}
+		}
 	}
 	return dir
 }
@@ -1027,6 +1099,8 @@ func backup(client *pbscommon.PBSClient, newchunk, reusechunk *atomic.Uint64, px
 	var err error
 	var readErrors []string
 	if usevss {
+		// Same orphan-shadow sweep as the multi-archive path (iwgw.4).
+		_ = snapshot.VSSCleanup()
 		err = snapshot.CreateVSSSnapshot(([]string{backupdir}), func(snaps map[string]snapshot.SnapShot) error {
 			// Get first snapshot from map (Go 1.22 compatible)
 			for _, snap := range snaps {
