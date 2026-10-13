@@ -10,12 +10,15 @@ import (
 	"hash"
 	"io"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"pbscommon"
 	"runtime"
 	"snapshot"
 	"strings"
+	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/alphadose/haxmap"
@@ -46,6 +49,18 @@ type ChunkState struct {
 	// a file's payload span can be recorded for next-run reuse.
 	recording bool
 	recorded  []pbscommon.ReusedChunk
+
+	// Upload pipeline: new chunks upload in a worker pool so the per-chunk RTT
+	// overlaps instead of serializing (the PBS session is a single HTTP/2
+	// connection that multiplexes streams). Started lazily on the first new
+	// chunk; drained in Eof before the index is closed.
+	upOnce    sync.Once
+	upClient  *pbscommon.PBSClient
+	upCh      chan uploadJob
+	jobsWg    sync.WaitGroup
+	workersWg sync.WaitGroup
+	upMu      sync.Mutex
+	upErr     error
 }
 
 func (c *ChunkState) Init(newchunk *atomic.Uint64, reusechunk *atomic.Uint64, knownChunks *haxmap.Map[string, bool]) {
@@ -74,10 +89,16 @@ func (c *ChunkState) emitCurrentChunk(client *pbscommon.PBSClient) error {
 	length := uint64(len(c.current_chunk))
 
 	if _, ok := c.knownChunks.GetOrSet(shahash, true); !ok {
-		c.newchunk.Add(1)
-		if err := client.UploadDynamicCompressedChunk(c.wrid, shahash, c.current_chunk); err != nil {
+		// Upload asynchronously — a synchronous upload per chunk makes the whole
+		// walk RTT-bound (measured ~300 ms per chunk on the win7->PBS path).
+		c.startUploadPool(client)
+		if err := c.pipelineErr(); err != nil {
 			return fmt.Errorf("failed to upload chunk %s: %w", shahash, err)
 		}
+		data := make([]byte, len(c.current_chunk))
+		copy(data, c.current_chunk)
+		c.jobsWg.Add(1)
+		c.upCh <- uploadJob{digest: shahash, data: data}
 	} else {
 		c.reusechunk.Add(1)
 	}
@@ -97,6 +118,63 @@ func (c *ChunkState) emitCurrentChunk(client *pbscommon.PBSClient) error {
 	c.chunkcount++
 	c.current_chunk = make([]byte, 0)
 	return nil
+}
+
+const uploadWorkers = 16
+
+type uploadJob struct {
+	digest string
+	data   []byte
+}
+
+// startUploadPool lazily launches the upload workers on the first new chunk of
+// this stream. Workers always drain the queue (skipping uploads once an error
+// is recorded), so a blocked enqueue can never deadlock on a failed run.
+func (c *ChunkState) startUploadPool(client *pbscommon.PBSClient) {
+	c.upOnce.Do(func() {
+		c.upClient = client
+		c.upCh = make(chan uploadJob, 128)
+		for i := 0; i < uploadWorkers; i++ {
+			c.workersWg.Add(1)
+			go c.uploadWorker()
+		}
+	})
+}
+
+func (c *ChunkState) uploadWorker() {
+	defer c.workersWg.Done()
+	for job := range c.upCh {
+		if c.pipelineErr() == nil {
+			if err := c.upClient.UploadDynamicCompressedChunk(c.wrid, job.digest, job.data); err != nil {
+				c.upMu.Lock()
+				if c.upErr == nil {
+					c.upErr = err
+				}
+				c.upMu.Unlock()
+			} else {
+				c.newchunk.Add(1)
+			}
+		}
+		c.jobsWg.Done()
+	}
+}
+
+func (c *ChunkState) pipelineErr() error {
+	c.upMu.Lock()
+	defer c.upMu.Unlock()
+	return c.upErr
+}
+
+// drainUploads waits for every queued chunk upload to finish and stops the
+// worker pool. No-op when the pool was never started (an all-reused stream).
+func (c *ChunkState) drainUploads() error {
+	if c.upCh == nil {
+		return nil
+	}
+	c.jobsWg.Wait()
+	close(c.upCh)
+	c.workersWg.Wait()
+	return c.pipelineErr()
 }
 
 // Break finalizes any pending chunk and resets the content-defined chunker, so
@@ -192,6 +270,10 @@ func (c *ChunkState) Eof(client *pbscommon.PBSClient) error {
 	if err := c.emitCurrentChunk(client); err != nil {
 		return err
 	}
+	// All queued uploads must have landed before the index is closed.
+	if err := c.drainUploads(); err != nil {
+		return err
+	}
 	//Avoid incurring in request entity too large by chunking assignment PUT requests in blocks of at most 128 chunks
 	for k := 0; k < len(c.assignments); k += 128 {
 		k2 := k + 128
@@ -210,6 +292,23 @@ func (c *ChunkState) Eof(client *pbscommon.PBSClient) error {
 }
 
 func main() {
+	// Tear every live PBS session down on any exit path we control: an exit
+	// without Close leaves the PBS-side backup task (and its group lock)
+	// running until TCP keepalive reaps it — through the socat→reverse-ssh
+	// chain that produced orphaned sessions holding the lock for hours.
+	defer pbscommon.CloseAllActive()
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		s := <-sigCh
+		fmt.Printf("received %v — closing PBS sessions before exit\n", s)
+		pbscommon.CloseAllActive()
+		os.Exit(2)
+	}()
+	os.Exit(run())
+}
+
+func run() int {
 	var newchunk *atomic.Uint64 = new(atomic.Uint64)
 	var reusechunk *atomic.Uint64 = new(atomic.Uint64)
 
@@ -227,7 +326,7 @@ func main() {
 
 			flag.PrintDefaults()
 		}
-		os.Exit(1)
+		return 1
 	}
 
 	L := clientcommon.Locking{}
@@ -236,7 +335,7 @@ func main() {
 	if !lock_ok {
 
 		dialog.Error("Backup jobs need to run exclusively, please wait until the previous job has finished")
-		os.Exit(2)
+		return 2
 	}
 	defer L.ReleaseProcessLock()
 
@@ -259,14 +358,14 @@ func main() {
 	if client.Username != "" {
 		if err := client.ObtainTicket(); err != nil {
 			fmt.Printf("Error: ticket login failed: %v\n", err)
-			os.Exit(1)
+			return 1
 		}
 	}
 	if cfg.Keyfile != "" {
 		crypt, err := pbscommon.LoadCryptConfigFromKeyfile(cfg.Keyfile)
 		if err != nil {
 			fmt.Printf("Error: loading encryption keyfile: %v\n", err)
-			os.Exit(1)
+			return 1
 		}
 		client.Crypt = crypt
 		fp := crypt.Fingerprint()
@@ -346,14 +445,14 @@ func main() {
 		client, err := clientcommon.SetupMailClient(cfg.SMTP.Host, cfg.SMTP.Port, cfg.SMTP.Username, cfg.SMTP.Password, cfg.SMTP.Insecure)
 		if err != nil {
 			fmt.Println("Cannot connect to mail server: " + err.Error())
-			os.Exit(1)
+			return 1
 		}
 		defer client.Quit()
 		for _, ccc := range cfg.SMTP.Mails {
 			err = clientcommon.SendMail(ccc.From, ccc.To, subject, msg, client)
 			if err != nil {
 				fmt.Println("Cannot send email: " + err.Error())
-				os.Exit(1)
+				return 1
 			}
 		}
 	}
@@ -363,12 +462,13 @@ func main() {
 	// committed but is missing unreadable files.
 	if mailCtx.Error != nil {
 		fmt.Fprintln(os.Stderr, "backup failed:", mailCtx.Error)
-		os.Exit(1)
+		return 1
 	}
 	if len(readErrors) > 0 {
 		fmt.Fprintf(os.Stderr, "backup completed with %d read error(s); snapshot is incomplete\n", len(readErrors))
-		os.Exit(3)
+		return 3
 	}
+	return 0
 
 }
 
@@ -548,7 +648,7 @@ func backup_real_split(client *pbscommon.PBSClient, newchunk, reusechunk *atomic
 	state := LoadReuseState(statePath)
 	newState := NewReuseState()
 	if statePath != "" {
-		archive.ReuseThreshold = 1024 * 1024 // 1 MiB — below this, reading is cheap
+		archive.ReuseThreshold = 0 // every file is span-aligned and reuse-eligible
 		archive.Hooks = pbscommon.ReuseHooks{
 			Break:       func() error { return ppxarChunk.Break(client) },
 			BeginRecord: ppxarChunk.BeginRecord,
@@ -605,13 +705,33 @@ func backup_real_split(client *pbscommon.PBSClient, newchunk, reusechunk *atomic
 // backup-id and archive names match an existing backup (the pull), each
 // archive's own /previous registers those chunks server-side, so unchanged data
 // is referenced instead of re-uploaded — this is how we reuse the pull's 850 GB.
+//
+// Per archive, two reuse layers (see sig_state.go):
+//   - Case A: whole-tree signature unchanged => reference both previous chunk
+//     streams wholesale, zero files read.
+//   - Case B: signature changed => walk and re-chunk, but per-file payload
+//     reuse (spans recorded in state) skips re-reading every unchanged file —
+//     one changed file no longer costs a full archive re-read. State is saved
+//     after EVERY archive's indexes close, so a crash mid-run does not force
+//     the next run to re-read the archives already done.
 func backup_multi_real(client *pbscommon.PBSClient, newchunk, reusechunk *atomic.Uint64, archives []ArchiveSpec, statePath string) ([]string, error) {
 	client.Connect(false, "host")
 	knownChunks := haxmap.New[string, bool]()
 	var readErrors []string
 
-	sigState := LoadSigState(statePath)
+	state := LoadSigState(statePath)
+	// Start from a clone of the loaded state: archives not reached by a crashed
+	// run keep their previous sigs+spans, and only completed archives overwrite
+	// theirs. Referencing always goes through the knownChunks guard, so a state
+	// saved by a run whose snapshot never committed can cause a re-read at
+	// worst, never a dangling reference.
 	newSigs := NewSigState()
+	for name, sig := range state.Sigs {
+		newSigs.Sigs[name] = sig
+	}
+	for name, files := range state.Files {
+		newSigs.Files[name] = files
+	}
 
 	for _, a := range archives {
 		mpxar := a.Name + ".mpxar.didx"
@@ -646,7 +766,7 @@ func backup_multi_real(client *pbscommon.PBSClient, newchunk, reusechunk *atomic
 			return readErrors, fmt.Errorf("signature %s (%s): %w", a.Name, a.Dir, err)
 		}
 		newSigs.Sigs[a.Name] = sig
-		prevSig, haveSig := sigState.Sigs[a.Name]
+		prevSig, haveSig := state.Sigs[a.Name]
 		fastPath := haveSig && prevSig == sig && len(mpRefChunks) > 0 && len(ppRefChunks) > 0
 
 		mp := ChunkState{}
@@ -662,7 +782,8 @@ func backup_multi_real(client *pbscommon.PBSClient, newchunk, reusechunk *atomic
 
 		if fastPath {
 			// Case A: unchanged archive — reference the previous snapshot's chunks
-			// for both streams without opening a single file.
+			// for both streams without opening a single file. Per-file spans carry
+			// over untouched (the clone in newSigs): the files did not change.
 			if err = mp.AssignKnown(mpRefChunks); err != nil {
 				return readErrors, err
 			}
@@ -676,15 +797,45 @@ func backup_multi_real(client *pbscommon.PBSClient, newchunk, reusechunk *atomic
 				return readErrors, err
 			}
 			fmt.Printf("Archive %s: UNCHANGED (%d files) — referenced %d chunks, no read\n", a.Name, nfiles, len(mpRefChunks)+len(ppRefChunks))
+			if err := SaveSigState(statePath, newSigs); err != nil {
+				fmt.Printf("warning: could not save state after %s: %v\n", a.Name, err)
+			}
 			continue
 		}
 
-		// Case B: changed (or no usable reference) — full content-defined read.
-		// Chunk-level dedup against knownChunks still avoids re-uploading unchanged
-		// data (e.g. against the pull), but every file is read.
+		// Case B: changed (or no usable reference) — walk the tree, but with
+		// per-file payload reuse: an unchanged file (same size+mtime, span in
+		// state) references its previous payload chunks instead of being re-read,
+		// so one changed file no longer costs a full archive re-read. Every
+		// referenced chunk is guarded against knownChunks (what the previous
+		// snapshot holds) — a stale span causes a re-read, never a dangling ref.
+		prevFiles := state.ArchiveFiles(a.Name)
+		newFiles := map[string]fileState{}
 		archive := &pbscommon.PXARArchive{}
-		archive.Split = true // content-defined (no reuse hooks) — matches the existing chunking
+		archive.Split = true
 		archive.ArchiveName = mpxar
+		archive.ReuseThreshold = 0 // every file is span-aligned and reuse-eligible
+		archive.Hooks = pbscommon.ReuseHooks{
+			Break:       func() error { return pp.Break(client) },
+			BeginRecord: pp.BeginRecord,
+			EndRecord:   pp.EndRecord,
+			AssignKnown: pp.AssignKnown,
+		}
+		archive.PayloadReuse = func(rel string, size, mtime uint64) ([]pbscommon.ReusedChunk, bool) {
+			fs, ok := prevFiles[rel]
+			if !ok || fs.Size != size || fs.Mtime != mtime || len(fs.Chunks) == 0 {
+				return nil, false
+			}
+			for _, ch := range fs.Chunks {
+				if _, exists := knownChunks.Get(ch.Digest); !exists {
+					return nil, false // previous snapshot no longer has it — re-read
+				}
+			}
+			return fs.Chunks, true
+		}
+		archive.ReuseSink = func(rel string, size, mtime uint64, chunks []pbscommon.ReusedChunk) {
+			newFiles[rel] = fileState{Size: size, Mtime: mtime, Chunks: chunks}
+		}
 		archive.WriteCB = func(b []byte) error { return mp.HandleData(b, client) }
 		archive.PayloadWriteCB = func(b []byte) error { return pp.HandleData(b, client) }
 		if _, err = archive.WriteDir(a.Dir, "", true); err != nil {
@@ -700,11 +851,18 @@ func backup_multi_real(client *pbscommon.PBSClient, newchunk, reusechunk *atomic
 			return readErrors, err
 		}
 		readErrors = append(readErrors, archive.ReadErrors...)
+		newSigs.SetArchiveFiles(a.Name, newFiles)
 		why := "changed"
 		if !haveSig {
 			why = "no reference sig"
 		}
-		fmt.Printf("Archive %s: READ %d files (%s)\n", a.Name, nfiles, why)
+		reused, read := archive.ReuseStats()
+		fmt.Printf("Archive %s: READ (%s) — %d files reused (not read), %d files read\n", a.Name, why, reused, read)
+		// Persist after EVERY archive: a crash later in the run must not force the
+		// next run to re-read the archives already done.
+		if err := SaveSigState(statePath, newSigs); err != nil {
+			fmt.Printf("warning: could not save state after %s: %v\n", a.Name, err)
+		}
 	}
 
 	if err := client.UploadManifest(); err != nil {

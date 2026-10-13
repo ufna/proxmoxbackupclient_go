@@ -66,6 +66,14 @@ var excludedSystemFiles = []string{
 	"hiberfil.sys",      // Hibernation file
 	"swapfile.sys",      // Windows swap file
 	"DumpStack.log.tmp", // Crash dump temporary file
+	"thumbs.db",         // Explorer thumbnail cache — rewritten by merely browsing a folder
+	"desktop.ini",       // Explorer folder view settings — same churn problem
+}
+
+// excludedSystemFilePrefixes match by name prefix: Office lock/owner files
+// ("~$report.docx") appear next to any edited document and vanish on close.
+var excludedSystemFilePrefixes = []string{
+	"~$",
 }
 
 // shouldSkipSystemFolder checks if a folder should be automatically excluded
@@ -84,6 +92,12 @@ func shouldSkipSystemFolder(name string) bool {
 func shouldSkipSystemFile(name string) bool {
 	for _, excluded := range excludedSystemFiles {
 		if strings.EqualFold(name, excluded) {
+			return true
+		}
+	}
+	lower := strings.ToLower(name)
+	for _, prefix := range excludedSystemFilePrefixes {
+		if strings.HasPrefix(lower, prefix) {
 			return true
 		}
 	}
@@ -350,7 +364,8 @@ type PXARArchive struct {
 	// caller in split mode when reuse is enabled).
 	Hooks ReuseHooks
 	// ReuseThreshold: only files at least this large are span-aligned and eligible
-	// for reuse (smaller files are cheap to read and would bloat the chunk index).
+	// for reuse. 0 makes every file eligible: small files bloat the chunk index
+	// but skip re-reading, which wins when the source disk is slow.
 	ReuseThreshold uint64
 	reusedFiles    int
 	readFiles      int
@@ -988,6 +1003,8 @@ func (a *PXARArchive) WriteFile(path string, basename string) (CatalogFile, erro
 
 	readbuffer := make([]byte, 1024*64)
 	var written uint64
+	var readFailed error
+	incomplete := false
 
 	for written < declaredSize {
 		toRead := uint64(len(readbuffer))
@@ -1006,17 +1023,29 @@ func (a *PXARArchive) WriteFile(path string, basename string) (CatalogFile, erro
 			break
 		}
 		if err != nil {
-			return CatalogFile{}, fmt.Errorf("failed to read from %s: %w", path, err)
+			// A mid-read hard error (disk hiccup, VSS shadow gone — e.g. "The
+			// device is not ready") must not kill the whole snapshot: flag the
+			// file incomplete and fall through to the zero-pad path so the
+			// stream stays aligned. The run reports partial (ReadErrors).
+			readFailed = err
+			break
 		}
 	}
 
-	// File shrank since Lstat (or read short): pad with zeros so the emitted
-	// payload matches the declared length and the stream stays aligned. Flag it as
-	// a content-instability read error so the backup is not reported as fully
+	// File shrank since Lstat, read short, or failed mid-read: pad with zeros so
+	// the emitted payload matches the declared length and the stream stays
+	// aligned. Flag it as a read error so the backup is not reported as fully
 	// verified (v2-H-02) rather than silently passing.
 	if written < declaredSize {
-		a.addReadError(
-			fmt.Sprintf("File shrank during backup, zero-padded to declared size (content inconsistent): %s", path))
+		incomplete = true
+		if readFailed != nil {
+			a.addReadError(
+				fmt.Sprintf("Read error at %d/%d bytes, zero-padded the remainder (content incomplete): %s (Error: %v)",
+					written, declaredSize, path, readFailed))
+		} else {
+			a.addReadError(
+				fmt.Sprintf("File shrank during backup, zero-padded to declared size (content inconsistent): %s", path))
+		}
 		pad := make([]byte, 1024*64)
 		for written < declaredSize {
 			n := uint64(len(pad))
@@ -1036,6 +1065,7 @@ func (a *PXARArchive) WriteFile(path string, basename string) (CatalogFile, erro
 		// silent truncation otherwise passed as success (v2-H-02).
 		var probe [1]byte
 		if n, _ := file.Read(probe[:]); n > 0 {
+			incomplete = true
 			a.addReadError(
 				fmt.Sprintf("File grew during backup, tail past %d bytes not captured (content incomplete): %s", declaredSize, path))
 		}
@@ -1047,12 +1077,15 @@ func (a *PXARArchive) WriteFile(path string, basename string) (CatalogFile, erro
 
 	if eligible {
 		// Close the span at a chunk boundary and record the chunks it produced so
-		// the next run can reuse this file if it is unchanged.
+		// the next run can reuse this file if it is unchanged. An incomplete file
+		// (read error/shrank/grew — its span holds padded or truncated data) is
+		// NOT recorded: its size+mtime may be unchanged next run, and reusing the
+		// bad span would cement corrupted data into every future snapshot.
 		if err := a.Hooks.Break(); err != nil {
 			return CatalogFile{}, err
 		}
 		chunks := a.Hooks.EndRecord()
-		if a.ReuseSink != nil {
+		if a.ReuseSink != nil && !incomplete {
 			a.ReuseSink(relPath, declaredSize, mtimeSecs, chunks)
 		}
 	}

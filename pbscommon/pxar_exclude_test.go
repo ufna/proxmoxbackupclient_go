@@ -38,6 +38,32 @@ func TestIsExcluded(t *testing.T) {
 	}
 }
 
+// TestShouldSkipSystemFile covers the auto-excluded Windows churn files:
+// pagefile-class names by exact match, Explorer caches (thumbs.db/desktop.ini)
+// case-insensitively, and Office lock files by the "~$" prefix.
+func TestShouldSkipSystemFile(t *testing.T) {
+	cases := []struct {
+		name string
+		want bool
+	}{
+		{"pagefile.sys", true},
+		{"Thumbs.db", true},
+		{"thumbs.DB", true},
+		{"desktop.ini", true},
+		{"DESKTOP.INI", true},
+		{"~$report.docx", true},
+		{"~WRL0001.tmp", false}, // Office temp, but not a "~$" lock file
+		{"report.docx", false},
+		{"photos.db", false},
+		{"desktop.ini.bak", false},
+	}
+	for _, c := range cases {
+		if got := shouldSkipSystemFile(c.name); got != c.want {
+			t.Errorf("shouldSkipSystemFile(%q) = %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
 // TestRelExcludePath checks that paths are reduced relative to the backup root so
 // absolute patterns and VSS-walked entries compare on the same (root-relative) basis.
 func TestRelExcludePath(t *testing.T) {

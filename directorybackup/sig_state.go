@@ -1,11 +1,20 @@
 package main
 
-// Per-archive tree signatures for the multi-archive metadata fast path. After a
-// run, each archive's (relpath,size,mtime) signature is stored. Next run, if an
-// archive's signature is unchanged, its content is unchanged and its chunks are
-// referenced from the previous snapshot (via /previous) WITHOUT reading a single
-// file. A missing/stale signature only causes a full re-read (Case B) — never a
-// stale reference, because a mismatched signature always falls back to reading.
+// Per-archive state for the multi-archive metadata fast path, in one JSON file.
+//
+// Two layers of reuse, checked per archive each run:
+//   - Sigs: whole-tree (relpath,size,mtime) signature. Unchanged => the archive's
+//     chunk streams are referenced from the previous snapshot wholesale (Case A),
+//     without reading a single file.
+//   - Files: per-file payload chunk spans recorded by the previous run. When the
+//     signature CHANGED (Case B), each unchanged file (same size+mtime) still
+//     references its recorded chunks instead of being re-read — one changed file
+//     no longer costs a full re-read of the archive.
+//
+// Both layers are only hints: a missing/stale entry at worst causes a re-read,
+// never a stale reference — Case B guards every referenced chunk against the
+// chunks the previous snapshot actually holds (seeded via /previous), and a
+// mismatched signature always falls back to reading.
 
 import (
 	"encoding/json"
@@ -16,9 +25,15 @@ import (
 
 type SigState struct {
 	Sigs map[string]string `json:"sigs"`
+	// Files maps archive name -> archive-relative path -> the file's payload
+	// span, for Case B per-file reuse. Rebuilt per archive on each Case B run;
+	// carried over untouched for Case A archives (their files did not change).
+	Files map[string]map[string]fileState `json:"files,omitempty"`
 }
 
-func NewSigState() *SigState { return &SigState{Sigs: map[string]string{}} }
+func NewSigState() *SigState {
+	return &SigState{Sigs: map[string]string{}, Files: map[string]map[string]fileState{}}
+}
 
 func LoadSigState(path string) *SigState {
 	if path == "" {
@@ -32,7 +47,24 @@ func LoadSigState(path string) *SigState {
 	if err := json.Unmarshal(raw, &s); err != nil || s.Sigs == nil {
 		return NewSigState()
 	}
+	if s.Files == nil {
+		s.Files = map[string]map[string]fileState{}
+	}
 	return &s
+}
+
+// ArchiveFiles returns the recorded per-file spans for an archive (nil if none).
+func (s *SigState) ArchiveFiles(name string) map[string]fileState {
+	return s.Files[name]
+}
+
+// SetArchiveFiles replaces an archive's per-file records (after its Case B run).
+func (s *SigState) SetArchiveFiles(name string, files map[string]fileState) {
+	if len(files) == 0 {
+		delete(s.Files, name)
+		return
+	}
+	s.Files[name] = files
 }
 
 func SaveSigState(path string, s *SigState) error {

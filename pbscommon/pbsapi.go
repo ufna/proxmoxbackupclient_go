@@ -763,6 +763,10 @@ func (pbs *PBSClient) UploadChunk(writerid uint64, digest string, chunkdata []by
 		fmt.Println("Error making request:", string(resp1), string(resp2.Proto))
 		return fmt.Errorf("Error making request: %s %s", string(resp1), string(resp2.Proto))
 	}
+	// Drain and close so the h2 stream is released — with pipelined uploads an
+	// unclosed body would leak a stream slot per chunk.
+	io.Copy(io.Discard, resp2.Body)
+	resp2.Body.Close()
 
 	return nil
 }
